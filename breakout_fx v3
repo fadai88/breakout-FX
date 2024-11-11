@@ -1,0 +1,151 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+
+file_path = 'C:/Users/user/Documents/Python Scripts/Python Scripts/'
+
+def create_df(file_name):
+    full_path = file_path + file_name
+    df = pd.read_csv(full_path, sep='\t')
+    df.columns = df.columns.str.replace('<', '').str.replace('>', '')
+    return df
+
+"""
+files = ['AUDNZD_H4.csv', 'AUDNZD_H1.csv', 'AUDNZD_M30.csv', 'EURGBP_H4.csv', 'EURGBP_H1.csv', 'EURCHF_H4.csv', 'EURCHF_H1.csv',
+         'EURUSD_H1.csv', 'EURUSD_M30.csv', 'EURUSD_M15.csv', 'GBPUSD_H1.csv', 'GBPUSD_M30.csv', 'GBPUSD_M15.csv', 'NZDUSD_H1.csv',
+         'NZDUSD_M30.csv', 'NZDUSD_M15.csv', 'AUDUSD_H1.csv', 'AUDUSD_M30.csv', 'AUDUSD_M15.csv']
+"""
+files = ['GBPJPY_H4.CSV', 'GBPJPY_H1.CSV', 'GBPJPY_M30.CSV', 'EURJPY_H4.CSV', 'EURJPY_H1.CSV', 'EURJPY_M30.CSV']
+# Store data and timeframe as tuple in dictionary
+data_dict = {}
+for file_name in files:
+    data = create_df(file_name)
+    timeframe = file_name[file_name.find('_')+1:file_name.find('.')]
+    data_dict[file_name] = (data, timeframe)
+
+def get_annual_multiplier(timeframe):
+    periods_per_day = {
+        'M1': 24 * 60,      # 1-minute: 1440 periods per day
+        'M5': 24 * 12,      # 5-minute: 288 periods per day
+        'M15': 24 * 4,      # 15-minute: 96 periods per day
+        'M30': 24 * 2,      # 30-minute: 48 periods per day
+        'H1': 24,           # 1-hour: 24 periods per day
+        'H4': 6,            # 4-hour: 6 periods per day
+        'D1': 1,            # Daily: 1 period per day
+        'W1': 1/7,          # Weekly: 0.14 periods per day
+        'MN': 1/30,         # Monthly: 0.033 periods per day
+    }
+    
+    if timeframe not in periods_per_day:
+        raise ValueError(f"Unsupported timeframe: {timeframe}. Supported timeframes are: {list(periods_per_day.keys())}")
+    
+    return 252 * periods_per_day[timeframe]
+
+def calculate_annual_return(total_return, df_length, timeframe):
+    annual_periods = get_annual_multiplier(timeframe)
+    return (1 + total_return) ** (annual_periods/df_length) - 1
+
+def backtest_breakout_strategy(df, timeframe):
+    # Calculate 50-day rolling high and low
+    df['50_day_high'] = df['CLOSE'].rolling(window=100).max()
+    df['50_day_low'] = df['CLOSE'].rolling(window=100).min()
+    
+    # Calculate ATR
+    df['high_low'] = df['HIGH'] - df['LOW']
+    df['high_close'] = abs(df['HIGH'] - df['CLOSE'].shift())
+    df['low_close'] = abs(df['LOW'] - df['CLOSE'].shift())
+    df['TR'] = pd.concat([df['high_low'], df['high_close'], df['low_close']], axis=1).max(axis=1)
+    df['ATR'] = df['TR'].rolling(window=14).mean()
+    
+    # Initialize position and signals
+    df['position'] = 0
+    df['signal'] = 0
+    df['returns'] = 0.0
+    
+    current_position = 0
+    trailing_stop = 0
+    highest_since_entry = 0
+    lowest_since_entry = float('inf')
+    atr_multiplier = 2.0
+    
+    # Generate signals
+    for i in range(50, len(df)):
+        price = df.iloc[i]['CLOSE']
+        high_50 = df.iloc[i-1]['50_day_high']
+        low_50 = df.iloc[i-1]['50_day_low']
+        current_atr = df.iloc[i]['ATR']
+        
+        if current_position == 0:
+            if price > high_50:
+                df.iloc[i, df.columns.get_loc('signal')] = 1
+                current_position = 1
+                highest_since_entry = price
+                trailing_stop = price - (current_atr * atr_multiplier)
+            elif price < low_50:
+                df.iloc[i, df.columns.get_loc('signal')] = -1
+                current_position = -1
+                lowest_since_entry = price
+                trailing_stop = price + (current_atr * atr_multiplier)
+        
+        elif current_position == 1:
+            # Update highest price seen and trailing stop if we make new highs
+            if price > highest_since_entry:
+                highest_since_entry = price
+                trailing_stop = highest_since_entry - (current_atr * atr_multiplier)
+            
+            # Check if price hits trailing stop
+            if price < trailing_stop:
+                df.iloc[i, df.columns.get_loc('signal')] = 0
+                current_position = 0
+                highest_since_entry = 0  # Reset the highest price
+        
+        elif current_position == -1:
+            # Update lowest price seen and trailing stop if we make new lows
+            if price < lowest_since_entry:
+                lowest_since_entry = price
+                trailing_stop = lowest_since_entry + (current_atr * atr_multiplier)
+            
+            # Check if price hits trailing stop
+            if price > trailing_stop:
+                df.iloc[i, df.columns.get_loc('signal')] = 0
+                current_position = 0
+                lowest_since_entry = float('inf')  # Reset the lowest price
+        
+        df.iloc[i, df.columns.get_loc('position')] = current_position
+    
+    # Calculate returns
+    df['price_returns'] = df['CLOSE'].pct_change()
+    df['strategy_returns'] = df['position'].shift(1) * df['price_returns']
+    df['cumulative_returns'] = (1 + df['strategy_returns']).cumprod()
+    
+    # Calculate performance metrics
+    total_trades = len(df[df['signal'] != 0])
+    total_return = df['cumulative_returns'].iloc[-1] - 1
+    annual_return = calculate_annual_return(total_return, len(df), timeframe)
+    daily_returns = df['strategy_returns'].dropna()
+    
+    annual_periods = get_annual_multiplier(timeframe)
+    sharpe_ratio = (daily_returns.mean() * annual_periods) / (daily_returns.std() * (annual_periods**0.5))
+    max_drawdown = (df['cumulative_returns'].cummax() - df['cumulative_returns']).max()
+    
+    results = {
+        'Total Trades': total_trades,
+        'Total Return': f"{total_return*100:.2f}%",
+        'Annualized Return': f"{annual_return*100:.2f}%",
+        'Sharpe Ratio': f"{sharpe_ratio:.2f}",
+        'Max Drawdown': f"{max_drawdown*100:.2f}%",
+        'Timeframe': timeframe
+    }
+    
+    return df, results
+
+# Run backtest for each instrument and timeframe
+results_dict = {}
+for file_name, (data, timeframe) in data_dict.items():
+    results_dict[file_name] = backtest_breakout_strategy(data, timeframe)
+
+# Optional: Print results for verification
+for file_name, (_, results) in results_dict.items():
+    print(f"\nResults for {file_name}:")
+    for metric, value in results.items():
+        print(f"{metric}: {value}")
+        
